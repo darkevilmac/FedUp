@@ -9,3 +9,4 @@
 
 rootProject.name = "fedup"
 include("fedup-extract")
+include("fedup-generator")
