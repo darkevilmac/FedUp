@@ -1,6 +1,7 @@
 package com.tridevmc.fedup.extract.internal.apk;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
 import com.tridevmc.fedup.extract.api.apk.IAPKAnalysisResult;
 import com.tridevmc.fedup.extract.api.apk.IAPKAnalyzer;
 import com.tridevmc.fedup.extract.api.gql.IRedditGQLOperation;
@@ -13,7 +14,10 @@ import jadx.core.dex.attributes.AType;
 import jadx.core.dex.attributes.AttrNode;
 import jadx.core.dex.attributes.AttributeStorage;
 import jadx.core.dex.attributes.FieldInitInsnAttr;
+import jadx.core.dex.instructions.ConstStringNode;
 import jadx.core.dex.nodes.FieldNode;
+import org.tinylog.Logger;
+import org.tinylog.TaggedLogger;
 import org.w3c.dom.Node;
 import org.xml.sax.SAXException;
 
@@ -25,6 +29,7 @@ import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.function.Predicate;
@@ -38,6 +43,8 @@ public class APKAnalyzer implements IAPKAnalyzer {
     private final Field ATTR_NODE_STORAGE;
     private JadxDecompiler jadx;
 
+    private static final TaggedLogger LOG = Logger.tag(APKAnalyzer.class.getCanonicalName());
+    
     {
         try {
             ATTR_NODE_STORAGE = AttrNode.class.getDeclaredField("storage");
@@ -180,55 +187,9 @@ public class APKAnalyzer implements IAPKAnalyzer {
 
         // Find all instances where the constructor of the previous classes are called, then store the values of all the strings passed to the constructor.
         List<PotentialRedditGQLOperationClass> potentialOperations = potentialRedditGQLOperationClasses.stream().map(
-                clazz -> {
-                    var constructor = clazz.getMethods().stream().filter(
-                            m -> m.getAccessFlags().isConstructor()
-                    ).findFirst().orElseThrow(
-                            () -> new RuntimeException("Failed to find constructor for class " + clazz.getFullName())
-                    );
-                    var constructorUsedIn = constructor.getUseIn();
-                    return new PotentialRedditGQLOperationClass(clazz, constructorUsedIn.stream().flatMap(
-                            javaNode -> {
-                                if (javaNode instanceof JavaMethod && javaNode.getFullName().contains("<clinit>")) {
-                                    // Static initializer, this is likely a class used to store constants.
-                                    var declaringClass = javaNode.getDeclaringClass();
-                                    return declaringClass.getFields().stream().map(
-                                            field -> {
-                                                FieldNode fieldNode = field.getFieldNode();
-                                                if (fieldNode.getType().isObject() &&
-                                                        Objects.equals(fieldNode.getType().getObject(), clazz.getFullName())) {
-                                                    var attributeStorageFromNode = getAttributeStorageFromNode(fieldNode);
-                                                    var fieldInitInsnAttr = (FieldInitInsnAttr) attributeStorageFromNode.get(AType.FIELD_INIT_INSN);
-                                                    if (fieldInitInsnAttr != null) {
-                                                        var arguments = fieldInitInsnAttr.getInsn().getArguments();
-                                                        var insnArgs = StreamSupport.stream(arguments.spliterator(), false).toList();
-                                                        return insnArgs;
-                                                    }
-                                                }
-                                                return null;
-                                            }
-                                    ).filter(f -> f != null && f.size() == 3);
-                                }
-                                return Stream.empty();
-                            }
-                    ).map(
-                            f -> {
-                                var arg0 = f.get(0).toString();
-                                var arg1 = f.get(1).toString();
-                                var arg2 = f.get(2).toString();
-                                arg0 = arg0.substring(2, arg0.length() - 2);
-                                arg1 = arg1.substring(2, arg1.length() - 2);
-                                arg2 = arg2.substring(2, arg2.length() - 2);
-                                // Remove any \n characters from arg2.
-                                arg2 = arg2.replace("\\n", "");
-                                return new ArgumentSet(
-                                        arg0,
-                                        arg1,
-                                        arg2
-                                );
-                            }
-                    ).toList());
-                }
+                clazz -> new PotentialRedditGQLOperationClass(clazz, clazz.getMethods().stream().filter(
+                        m -> m.getAccessFlags().isConstructor()
+                ).flatMap(constructor -> getArgumentSetsForConstructor(constructor).stream().filter(Objects::nonNull)).toList())
         ).filter(PotentialRedditGQLOperationClass::hasAnyArgumentSets).toList();
 
         return potentialOperations.stream().flatMap(
@@ -240,6 +201,190 @@ public class APKAnalyzer implements IAPKAnalyzer {
                         )
                 )
         ).toList();
+    }
+
+    private List<ArgumentSet> getArgumentSetsForConstructor(JavaMethod constructor) {
+
+        var stringArguments = constructor.getArguments().stream().filter(
+                a -> a.isObject() && a.getObject().equals("java.lang.String")
+        ).toList();
+        if (constructor.getArguments().size() == 3 && stringArguments.size() == 3) {
+            return getArgumentSetsForDataClassStyleConstructor(constructor);
+        } else if (constructor.getArguments().size() == 0) {
+            return Lists.newArrayList(getArgumentSetsForNoArgConstructor(constructor));
+        } else if (stringArguments.size() >= 3) {
+            return getArgumentSetsForStringConstructor(constructor);
+        } else {
+            LOG.debug("Found unknown constructor: " + constructor.toString());
+            return ImmutableList.of();
+        }
+    }
+
+    /**
+     * This is assumed to be a constructor that takes at least three string arguments, so we just want to find the ones that are most likely to be the operation id, name, and definition.
+     *
+     * @param constructor The constructor to find the argument sets for.
+     * @return The list of argument sets found.
+     */
+    private List<ArgumentSet> getArgumentSetsForStringConstructor(JavaMethod constructor) {
+        LOG.debug("Found potential RedditGQLOperation constructor: " + constructor.toString());
+        Predicate<String> operationIdPredicate = s -> {
+            // An operationId is 12 characters long and contains only numbers and lowercase letters.
+            return s.length() == 12 && s.chars().allMatch(
+                    c -> (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z')
+            );
+        };
+        Predicate<String> operationNamePredicate = s -> {
+            // An operation name is a string that starts with an uppercase letter and contains only letters and numbers.
+            var firstChar = s.charAt(0);
+            var isAlphaNumeric = s.chars().allMatch(
+                    c -> (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z')
+            );
+            return firstChar == Character.toUpperCase(firstChar) && isAlphaNumeric;
+        };
+        Predicate<String> operationDefinitionPredicate = s -> {
+            // An operation definition is a string that contains the word "query" or "mutation".
+            var sLower = s.toLowerCase();
+            return sLower.contains("query") || sLower.contains("mutation");
+        };
+
+        var argCount = constructor.getArguments().size();
+        return constructor.getUseIn().stream().flatMap(
+                javaNode -> {
+                    if (javaNode instanceof JavaMethod && javaNode.getFullName().contains("<clinit>")) {
+                        // Static initializer, this is likely a class used to store constants.
+                        var declaringClass = javaNode.getDeclaringClass();
+                        return declaringClass.getFields().stream().map(
+                                field -> {
+                                    FieldNode fieldNode = field.getFieldNode();
+                                    if (fieldNode.getType().isObject() &&
+                                            Objects.equals(fieldNode.getType().getObject(), constructor.getDeclaringClass().getRawName())) {
+                                        var attributeStorageFromNode = getAttributeStorageFromNode(fieldNode);
+                                        var fieldInitInsnAttr = (FieldInitInsnAttr) attributeStorageFromNode.get(AType.FIELD_INIT_INSN);
+                                        if (fieldInitInsnAttr != null) {
+                                            var arguments = fieldInitInsnAttr.getInsn().getArguments();
+                                            var insnArgs = StreamSupport.stream(arguments.spliterator(), false).toList();
+                                            return insnArgs;
+                                        }
+                                    }
+                                    return null;
+                                }
+                        ).filter(f -> f != null && f.size() == argCount);
+                    }
+                    return Stream.empty();
+                }
+        ).map(
+                f -> {
+                    var stringArgs = f.stream().filter(a -> a.getType().isObject() && a.getType().getObject().equals("java.lang.String")).map(a -> {
+                        var s = a.toString();
+                        var l = s.length();
+                        return s.substring(2, l - 2);
+                    }).toList();
+                    if (stringArgs.size() >= 3) {
+                        var operationId = stringArgs.stream().filter(operationIdPredicate).findFirst().orElse(null);
+                        var operationName = stringArgs.stream().filter(operationNamePredicate).findFirst().orElse(null);
+                        var operationDefinition = stringArgs.stream().filter(operationDefinitionPredicate).findFirst().orElse(null);
+                        if (operationId != null && operationName != null && operationDefinition != null) {
+                            return new ArgumentSet(operationId, operationName, operationDefinition);
+                        } else {
+                            LOG.debug("Unknown constructor: " + constructor);
+                        }
+                    }
+                    return null;
+                }
+        ).filter(Objects::nonNull).toList();
+    }
+
+    private List<ArgumentSet> getArgumentSetsForDataClassStyleConstructor(JavaMethod constructor) {
+        LOG.debug("Found data class style constructor: " + constructor);
+        // This is assumed to be a constructor that takes three string arguments, so we just want to find the uses and extract the values passed.
+        var clazz = constructor.getDeclaringClass();
+        return constructor.getUseIn().stream().flatMap(
+                javaNode -> {
+                    if(constructor.getFullName().contains("firebase")) {
+                        LOG.debug("Found use in: " + javaNode);
+                    }
+                    if (javaNode instanceof JavaMethod && javaNode.getFullName().contains("<clinit>")) {
+                        // Static initializer, this is likely a class used to store constants.
+                        var declaringClass = javaNode.getDeclaringClass();
+                        return declaringClass.getFields().stream().map(
+                                field -> {
+                                    FieldNode fieldNode = field.getFieldNode();
+                                    if (fieldNode.getType().isObject() &&
+                                            Objects.equals(fieldNode.getType().getObject(), clazz.getFullName())) {
+                                        var attributeStorageFromNode = getAttributeStorageFromNode(fieldNode);
+                                        var fieldInitInsnAttr = (FieldInitInsnAttr) attributeStorageFromNode.get(AType.FIELD_INIT_INSN);
+                                        if (fieldInitInsnAttr != null) {
+                                            var arguments = fieldInitInsnAttr.getInsn().getArguments();
+                                            var insnArgs = StreamSupport.stream(arguments.spliterator(), false).toList();
+                                            return insnArgs;
+                                        }
+                                    }
+                                    return null;
+                                }
+                        ).filter(f -> f != null && f.size() == 3);
+                    }
+                    return Stream.empty();
+                }
+        ).map(
+                f -> {
+                    var arg0 = f.get(0).toString();
+                    var arg1 = f.get(1).toString();
+                    var arg2 = f.get(2).toString();
+                    arg0 = arg0.substring(2, arg0.length() - 2);
+                    arg1 = arg1.substring(2, arg1.length() - 2);
+                    arg2 = arg2.substring(2, arg2.length() - 2);
+                    // Remove any \n characters from arg2.
+                    arg2 = arg2.replace("\\n", "");
+                    return new ArgumentSet(
+                            arg0,
+                            arg1,
+                            arg2
+                    );
+                }
+        ).toList();
+    }
+
+    /**
+     * Gets the values assigned to the fields of the class by the given default constructor.
+     * <p>
+     * This seems to be caused by a compiler optimization/obfuscation, or just some weird Kotlin thing.
+     *
+     * @param constructor The constructor to get the values from.
+     * @return The values assigned to the fields of the class by the given default constructor.
+     */
+    private ArgumentSet getArgumentSetsForNoArgConstructor(JavaMethod constructor) {
+        LOG.debug("Found no-arg constructor: " + constructor);
+        // This is assumed to be a constructor that takes no arguments, so we need to scan the actual code to find any string literals.
+        var methodNode = constructor.getMethodNode();
+        methodNode.reload();
+        var constStrings = Arrays.stream(methodNode.getInstructions())
+                .filter(i -> i instanceof ConstStringNode)
+                .map(n -> ((ConstStringNode) n).getString())
+                .toList();
+        if (methodNode.getInstructions().length == 0) {
+            LOG.debug("No instructions for method: " + constructor.getFullName());
+            return null;
+        }
+        if (constStrings.size() == 0) {
+            LOG.debug("No const strings for method: " + constructor.getFullName());
+            LOG.debug(Arrays.toString(methodNode.getInstructions()));
+            return null;
+        }
+        if (constStrings.size() == 3) {
+            var arg0 = constStrings.get(0);
+            var arg1 = constStrings.get(1);
+            var arg2 = constStrings.get(2);
+            return new ArgumentSet(
+                    arg0,
+                    arg1,
+                    arg2
+            );
+        } else {
+            LOG.debug("Unknown constructor: " + constructor.getFullName());
+            LOG.debug("Const strings: " + constStrings);
+        }
+        return null;
     }
 
     private AttributeStorage getAttributeStorageFromNode(AttrNode node) {

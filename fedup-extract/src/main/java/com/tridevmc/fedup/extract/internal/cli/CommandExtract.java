@@ -3,6 +3,8 @@ package com.tridevmc.fedup.extract.internal.cli;
 
 import com.google.gson.GsonBuilder;
 import com.tridevmc.fedup.extract.api.apk.IAPKAnalyzer;
+import org.tinylog.Logger;
+import org.tinylog.TaggedLogger;
 import org.tinylog.configuration.Configuration;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
@@ -24,6 +26,10 @@ public class CommandExtract implements Callable<Integer> {
     public Integer call() throws Exception {
         var exportToStdout = this.output == null;
         var inputFile = new File(this.input);
+        TaggedLogger LOG = null;
+        if (!exportToStdout) {
+            LOG = Logger.tag("fedup-extract");
+        }
         if (inputFile.exists()) {
             if (inputFile.getName().endsWith(".apk")) {
                 if (exportToStdout) {
@@ -34,7 +40,7 @@ public class CommandExtract implements Callable<Integer> {
                 } else {
                     var outputFile = new File(this.output);
                     if (outputFile.exists()) {
-                        System.out.println("Output file already exists, please select a different output file.");
+                        LOG.info("Output file already exists, please select a different output file.");
                         return 1;
                     }
                     var outputString = this.generateOutputString(inputFile);
@@ -42,11 +48,11 @@ public class CommandExtract implements Callable<Integer> {
                 }
                 return 0;
             } else {
-                System.out.println("Input file is not an APK.");
+                LOG.info("Input file is not an APK.");
                 return 1;
             }
         } else {
-            System.out.println("Input file does not exist.");
+            LOG.info("Input file does not exist.");
             return 1;
         }
     }
